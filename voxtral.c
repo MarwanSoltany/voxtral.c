@@ -895,14 +895,6 @@ int vox_stream_finish(vox_stream_t *s) {
     /* Process remaining encoder chunks and generate remaining tokens */
     stream_run_encoder(s);
     stream_run_decoder(s);
-
-    if (vox_verbose >= 1) {
-        fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
-                s->mel_cursor, s->total_adapter, s->encoder_ms);
-        if (s->n_generated > 0)
-            fprintf(stderr, "Decoder: %d tokens in %.0f ms (%.1f ms/token)\n",
-                    s->n_generated, s->decoder_ms, s->decoder_ms / s->n_generated);
-    }
     return 0;
 }
 
@@ -918,6 +910,16 @@ int vox_stream_get(vox_stream_t *s, const char **out_tokens, int max) {
 
 void vox_stream_free(vox_stream_t *s) {
     if (!s) return;
+
+    /* Print stats after caller has drained all tokens */
+    if (vox_verbose >= 1) {
+        fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
+                s->mel_cursor, s->total_adapter, s->encoder_ms);
+        if (s->n_generated > 0)
+            fprintf(stderr, "Decoder: %d tokens in %.0f ms (%.1f ms/token)\n",
+                    s->n_generated, s->decoder_ms, s->decoder_ms / s->n_generated);
+    }
+
     vox_mel_free(s->mel_ctx);
     if (s->tokenizer) vox_tokenizer_free(s->tokenizer);
     free(s->adapter_buf);
