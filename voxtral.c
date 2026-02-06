@@ -356,7 +356,9 @@ struct vox_stream {
 
     /* Incremental conv stem state */
     float *mel_tail;           /* [128 * 2] last 2 mel frames (column-major: [128, 2]) */
-    float *conv0_tail;         /* [1280 * 2] last 2 conv0 output frames ([1280, 2]) */
+    float *conv0_tail;         /* [1280 * 2] last 2 conv0 outputs consumed by conv1 */
+    float *conv0_residual;     /* [1280] 0 or 1 conv0 output pending stride alignment */
+    int conv0_residual_count;  /* 0 or 1 */
     int conv_stem_initialized; /* 0 for first chunk */
 
     /* Residual encoder positions for 4x downsample alignment */
@@ -423,6 +425,11 @@ static void stream_enqueue_token(vox_stream_t *s, const char *piece) {
  * Incremental conv stem: process new mel frames through conv0/conv1,
  * using tail buffers for boundary correctness.
  *
+ * Conv1 has stride=2, so we must feed it an even number of conv0 outputs
+ * to avoid right-side zero-padding that would corrupt the last output and
+ * shift stride alignment for all subsequent chunks. Any odd remainder is
+ * saved as conv0_residual and prepended to the next chunk.
+ *
  * Returns a newly-allocated buffer of [*out_len, 1280] post-conv positions.
  * Caller must free. Returns NULL if out_len == 0.
  */
@@ -434,8 +441,14 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
 
     if (n_new_mel <= 0) return NULL;
 
+    int is_first = 0;
+
+    /* === Phase 1: Conv0 — produce new conv0 outputs [dim, conv0_new_len] === */
+    int conv0_new_len;
+    float *conv0_new; /* [dim, conv0_new_len] column-major, caller frees */
+
     if (!s->conv_stem_initialized) {
-        /* First chunk: run conv stem normally (zero left-pad is correct for start) */
+        is_first = 1;
 
         /* Transpose mel [n_new_mel, 128] -> [128, n_new_mel] */
         float *conv_in = (float *)malloc((size_t)VOX_MEL_BINS * n_new_mel * sizeof(float));
@@ -443,57 +456,27 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
             for (int m = 0; m < VOX_MEL_BINS; m++)
                 conv_in[m * n_new_mel + f] = mel_new[f * VOX_MEL_BINS + m];
 
-        /* Conv0: [128, n_new_mel] -> [1280, n_new_mel] (k=3, s=1, causal) */
-        int conv0_len = n_new_mel; /* causal conv k=3 s=1: out_len = in_len */
-        float *conv0_out = (float *)malloc((size_t)dim * conv0_len * sizeof(float));
-        vox_causal_conv1d(conv0_out, conv_in, enc->conv0_weight, enc->conv0_bias,
+        conv0_new_len = n_new_mel;
+        conv0_new = (float *)malloc((size_t)dim * conv0_new_len * sizeof(float));
+        vox_causal_conv1d(conv0_new, conv_in, enc->conv0_weight, enc->conv0_bias,
                           VOX_MEL_BINS, dim, n_new_mel, 3, 1);
-        vox_gelu(conv0_out, dim * conv0_len);
+        vox_gelu(conv0_new, dim * conv0_new_len);
         free(conv_in);
 
-        /* Save last 2 mel frames (column-major) */
-        if (!s->mel_tail) s->mel_tail = (float *)malloc((size_t)VOX_MEL_BINS * 2 * sizeof(float));
-        int tail_start = n_new_mel >= 2 ? n_new_mel - 2 : 0;
-        int tail_count = n_new_mel >= 2 ? 2 : n_new_mel;
+        /* Save last 2 mel frames (column-major [128, 2]) */
+        if (!s->mel_tail) s->mel_tail = (float *)calloc((size_t)VOX_MEL_BINS * 2, sizeof(float));
+        int ts = n_new_mel >= 2 ? n_new_mel - 2 : 0;
+        int tc = n_new_mel >= 2 ? 2 : n_new_mel;
         memset(s->mel_tail, 0, (size_t)VOX_MEL_BINS * 2 * sizeof(float));
-        for (int f = 0; f < tail_count; f++)
+        for (int f = 0; f < tc; f++)
             for (int m = 0; m < VOX_MEL_BINS; m++)
-                s->mel_tail[m * 2 + (2 - tail_count + f)] = mel_new[(tail_start + f) * VOX_MEL_BINS + m];
-
-        /* Save last 2 conv0 frames (column-major: [1280, 2]) */
-        if (!s->conv0_tail) s->conv0_tail = (float *)malloc((size_t)dim * 2 * sizeof(float));
-        tail_start = conv0_len >= 2 ? conv0_len - 2 : 0;
-        tail_count = conv0_len >= 2 ? 2 : conv0_len;
-        memset(s->conv0_tail, 0, (size_t)dim * 2 * sizeof(float));
-        for (int f = 0; f < tail_count; f++)
-            for (int d = 0; d < dim; d++)
-                s->conv0_tail[d * 2 + (2 - tail_count + f)] = conv0_out[d * conv0_len + f + tail_start];
-
-        /* Conv1: [1280, conv0_len] -> [1280, ceil(conv0_len/2)] (k=3, s=2, causal) */
-        int conv1_len = (conv0_len + 1) / 2; /* ceil(conv0_len / 2) */
-        float *conv1_out = (float *)malloc((size_t)dim * conv1_len * sizeof(float));
-        vox_causal_conv1d(conv1_out, conv0_out, enc->conv1_weight, enc->conv1_bias,
-                          dim, dim, conv0_len, 3, 2);
-        vox_gelu(conv1_out, dim * conv1_len);
-        free(conv0_out);
-
-        /* Transpose: [1280, conv1_len] -> [conv1_len, 1280] */
-        float *result = (float *)malloc((size_t)conv1_len * dim * sizeof(float));
-        for (int si = 0; si < conv1_len; si++)
-            for (int d = 0; d < dim; d++)
-                result[si * dim + d] = conv1_out[d * conv1_len + si];
-        free(conv1_out);
+                s->mel_tail[m * 2 + (2 - tc + f)] = mel_new[(ts + f) * VOX_MEL_BINS + m];
 
         s->conv_stem_initialized = 1;
-        *out_len = conv1_len;
-        return result;
     } else {
-        /* Subsequent chunks: prepend tails for boundary correctness */
-
-        /* Transpose new mel [n_new_mel, 128] -> [128, n_new_mel] */
+        /* Subsequent chunks: prepend mel_tail for conv0 boundary */
         int padded_mel_len = 2 + n_new_mel;
         float *conv_in = (float *)malloc((size_t)VOX_MEL_BINS * padded_mel_len * sizeof(float));
-        /* Prepend mel_tail (2 frames) */
         for (int m = 0; m < VOX_MEL_BINS; m++) {
             conv_in[m * padded_mel_len + 0] = s->mel_tail[m * 2 + 0];
             conv_in[m * padded_mel_len + 1] = s->mel_tail[m * 2 + 1];
@@ -501,72 +484,133 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
                 conv_in[m * padded_mel_len + 2 + f] = mel_new[f * VOX_MEL_BINS + m];
         }
 
-        /* Conv0: [128, 2+n_new_mel] -> [1280, 2+n_new_mel] (k=3, s=1, causal) */
-        int conv0_full_len = padded_mel_len;
-        float *conv0_out_full = (float *)malloc((size_t)dim * conv0_full_len * sizeof(float));
-        vox_causal_conv1d(conv0_out_full, conv_in, enc->conv0_weight, enc->conv0_bias,
+        float *conv0_full = (float *)malloc((size_t)dim * padded_mel_len * sizeof(float));
+        vox_causal_conv1d(conv0_full, conv_in, enc->conv0_weight, enc->conv0_bias,
                           VOX_MEL_BINS, dim, padded_mel_len, 3, 1);
-        vox_gelu(conv0_out_full, dim * conv0_full_len);
+        vox_gelu(conv0_full, dim * padded_mel_len);
         free(conv_in);
 
-        /* Discard first 2 outputs (from overlap region, contaminated by zero-pad) */
-        /* New conv0 outputs: [1280, n_new_mel] starting at offset 2 */
-        int conv0_new_len = n_new_mel;
+        /* Discard first 2 (from overlap, contaminated by zero-pad) */
+        conv0_new_len = n_new_mel;
+        conv0_new = (float *)malloc((size_t)dim * conv0_new_len * sizeof(float));
+        for (int d = 0; d < dim; d++)
+            memcpy(conv0_new + (size_t)d * conv0_new_len,
+                   conv0_full + (size_t)d * padded_mel_len + 2,
+                   (size_t)conv0_new_len * sizeof(float));
+        free(conv0_full);
 
-        /* Save last 2 mel frames */
-        int tail_start = n_new_mel >= 2 ? n_new_mel - 2 : 0;
-        int tail_count = n_new_mel >= 2 ? 2 : n_new_mel;
+        /* Update mel_tail */
+        int ts = n_new_mel >= 2 ? n_new_mel - 2 : 0;
+        int tc = n_new_mel >= 2 ? 2 : n_new_mel;
         memset(s->mel_tail, 0, (size_t)VOX_MEL_BINS * 2 * sizeof(float));
-        for (int f = 0; f < tail_count; f++)
+        for (int f = 0; f < tc; f++)
             for (int m = 0; m < VOX_MEL_BINS; m++)
-                s->mel_tail[m * 2 + (2 - tail_count + f)] = mel_new[(tail_start + f) * VOX_MEL_BINS + m];
-
-        /* Prepend conv0_tail (2 frames) to new conv0 outputs for conv1 */
-        int padded_conv0_len = 2 + conv0_new_len;
-        float *conv0_padded = (float *)malloc((size_t)dim * padded_conv0_len * sizeof(float));
-        for (int d = 0; d < dim; d++) {
-            conv0_padded[d * padded_conv0_len + 0] = s->conv0_tail[d * 2 + 0];
-            conv0_padded[d * padded_conv0_len + 1] = s->conv0_tail[d * 2 + 1];
-            for (int f = 0; f < conv0_new_len; f++)
-                conv0_padded[d * padded_conv0_len + 2 + f] = conv0_out_full[d * conv0_full_len + 2 + f];
-        }
-
-        /* Update conv0_tail for next chunk from current padded conv0 input. */
-        int c0_tail_start = padded_conv0_len >= 2 ? padded_conv0_len - 2 : 0;
-        int c0_tail_count = padded_conv0_len >= 2 ? 2 : padded_conv0_len;
-        memset(s->conv0_tail, 0, (size_t)dim * 2 * sizeof(float));
-        for (int f = 0; f < c0_tail_count; f++)
-            for (int d = 0; d < dim; d++)
-                s->conv0_tail[d * 2 + (2 - c0_tail_count + f)] = conv0_padded[d * padded_conv0_len + c0_tail_start + f];
-
-        free(conv0_out_full);
-
-        /* Conv1: [1280, 2+conv0_new_len] -> [1280, M] (k=3, s=2, causal) */
-        int conv1_full_len = (padded_conv0_len + 1) / 2;
-        float *conv1_out = (float *)malloc((size_t)dim * conv1_full_len * sizeof(float));
-        vox_causal_conv1d(conv1_out, conv0_padded, enc->conv1_weight, enc->conv1_bias,
-                          dim, dim, padded_conv0_len, 3, 2);
-        vox_gelu(conv1_out, dim * conv1_full_len);
-        free(conv0_padded);
-
-        /* Discard first 1 output (from overlap) */
-        int conv1_new_len = conv1_full_len - 1;
-        if (conv1_new_len <= 0) {
-            free(conv1_out);
-            *out_len = 0;
-            return NULL;
-        }
-
-        /* Transpose: [1280, conv1_new_len] -> [conv1_new_len, 1280] */
-        float *result = (float *)malloc((size_t)conv1_new_len * dim * sizeof(float));
-        for (int si = 0; si < conv1_new_len; si++)
-            for (int d = 0; d < dim; d++)
-                result[si * dim + d] = conv1_out[d * conv1_full_len + 1 + si];
-        free(conv1_out);
-
-        *out_len = conv1_new_len;
-        return result;
+                s->mel_tail[m * 2 + (2 - tc + f)] = mel_new[(ts + f) * VOX_MEL_BINS + m];
     }
+
+    /* === Phase 2: Stride alignment — ensure even count for conv1 === */
+    int prev_res = s->conv0_residual_count;
+    int total_avail = prev_res + conv0_new_len;
+    int new_res = total_avail & 1; /* 1 if odd, 0 if even */
+    int feed_from_new = conv0_new_len - new_res;
+    int feed_total = prev_res + feed_from_new; /* always even */
+
+    if (feed_total <= 0) {
+        /* Not enough to feed conv1 — just save residual */
+        if (new_res && conv0_new_len > 0) {
+            if (!s->conv0_residual)
+                s->conv0_residual = (float *)malloc((size_t)dim * sizeof(float));
+            for (int d = 0; d < dim; d++)
+                s->conv0_residual[d] = conv0_new[(size_t)d * conv0_new_len + conv0_new_len - 1];
+        }
+        s->conv0_residual_count = new_res;
+        free(conv0_new);
+        return NULL;
+    }
+
+    /* Build feed buffer [dim, feed_total] column-major */
+    float *feed = (float *)malloc((size_t)dim * feed_total * sizeof(float));
+    int fpos = 0;
+
+    /* Copy old residual first (before overwriting with new) */
+    if (prev_res == 1) {
+        for (int d = 0; d < dim; d++)
+            feed[(size_t)d * feed_total + 0] = s->conv0_residual[d];
+        fpos = 1;
+    }
+
+    /* Copy feed_from_new values from conv0_new */
+    for (int d = 0; d < dim; d++)
+        memcpy(feed + (size_t)d * feed_total + fpos,
+               conv0_new + (size_t)d * conv0_new_len,
+               (size_t)feed_from_new * sizeof(float));
+
+    /* Save new residual (last value of conv0_new) if total was odd */
+    if (new_res) {
+        if (!s->conv0_residual)
+            s->conv0_residual = (float *)malloc((size_t)dim * sizeof(float));
+        for (int d = 0; d < dim; d++)
+            s->conv0_residual[d] = conv0_new[(size_t)d * conv0_new_len + conv0_new_len - 1];
+    }
+    s->conv0_residual_count = new_res;
+    free(conv0_new);
+
+    /* === Phase 3: Conv1 === */
+    float *conv1_in;
+    int conv1_in_len;
+    int conv1_discard; /* outputs to discard at front */
+
+    if (is_first) {
+        /* First chunk: zero left-pad is correct for start of sequence */
+        conv1_in = feed; /* aliased, freed after conv1 */
+        conv1_in_len = feed_total;
+        conv1_discard = 0;
+    } else {
+        /* Subsequent: prepend conv0_tail (2 frames) for boundary context */
+        conv1_in_len = 2 + feed_total;
+        conv1_in = (float *)malloc((size_t)dim * conv1_in_len * sizeof(float));
+        for (int d = 0; d < dim; d++) {
+            conv1_in[(size_t)d * conv1_in_len + 0] = s->conv0_tail[d * 2 + 0];
+            conv1_in[(size_t)d * conv1_in_len + 1] = s->conv0_tail[d * 2 + 1];
+            memcpy(conv1_in + (size_t)d * conv1_in_len + 2,
+                   feed + (size_t)d * feed_total,
+                   (size_t)feed_total * sizeof(float));
+        }
+        conv1_discard = 1;
+    }
+
+    /* Update conv0_tail from last 2 of feed (before freeing feed) */
+    if (!s->conv0_tail) s->conv0_tail = (float *)calloc((size_t)dim * 2, sizeof(float));
+    for (int d = 0; d < dim; d++) {
+        s->conv0_tail[d * 2 + 0] = feed[(size_t)d * feed_total + feed_total - 2];
+        s->conv0_tail[d * 2 + 1] = feed[(size_t)d * feed_total + feed_total - 1];
+    }
+    if (!is_first) free(feed);
+
+    /* conv1_in_len is always even → conv1 output count = conv1_in_len / 2 */
+    int conv1_out_len = conv1_in_len / 2;
+    float *conv1_out = (float *)malloc((size_t)dim * conv1_out_len * sizeof(float));
+    vox_causal_conv1d(conv1_out, conv1_in, enc->conv1_weight, enc->conv1_bias,
+                      dim, dim, conv1_in_len, 3, 2);
+    vox_gelu(conv1_out, dim * conv1_out_len);
+    if (is_first) free(feed); /* was aliased to conv1_in */
+    else free(conv1_in);
+
+    int result_len = conv1_out_len - conv1_discard;
+    if (result_len <= 0) {
+        free(conv1_out);
+        return NULL;
+    }
+
+    /* Transpose [dim, result_len] -> [result_len, dim] (row-major) */
+    float *result = (float *)malloc((size_t)result_len * dim * sizeof(float));
+    for (int si = 0; si < result_len; si++)
+        for (int d = 0; d < dim; d++)
+            result[(size_t)si * dim + d] = conv1_out[(size_t)d * conv1_out_len + conv1_discard + si];
+    free(conv1_out);
+
+    *out_len = result_len;
+    return result;
 }
 
 /* Run encoder incrementally on available mel, append adapter tokens */
@@ -883,6 +927,7 @@ void vox_stream_free(vox_stream_t *s) {
     free(s->tok_tmp);
     free(s->mel_tail);
     free(s->conv0_tail);
+    free(s->conv0_residual);
     free(s->enc_residual);
     free(s);
 }
